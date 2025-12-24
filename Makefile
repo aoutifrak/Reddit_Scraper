@@ -1,6 +1,7 @@
 # Reddit User Scraper Pipeline - Service Management
 # Usage: make install && make start
 
+
 SHELL := /bin/bash
 SERVICE_NAME := reddit-scraper
 SERVICE_FILE := /etc/systemd/system/$(SERVICE_NAME).service
