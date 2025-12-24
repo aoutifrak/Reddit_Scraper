@@ -1,0 +1,4 @@
+# List of subreddits to scrape (one per line)
+# Lines starting with # are comments and will be ignored
+
+gonewild
