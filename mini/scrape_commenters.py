@@ -67,27 +67,6 @@ def load_gluetun_env() -> Dict[str, str]:
         "SOCKS5PROXY": "on",
     }
 
-    # First try to load from .env file
-    env_file = parent / ".env"
-    if env_file.exists():
-        try:
-            with env_file.open("r", encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    if "=" in line:
-                        key, _, value = line.partition("=")
-                        key = key.strip()
-                        value = value.strip()
-                        # Map environment variable names to Gluetun expected names
-                        if key in ("VPN_SERVICE_PROVIDER", "OPENVPN_USER", "OPENVPN_PASSWORD", 
-                                   "SERVER_COUNTRIES", "SERVER_CITIES", "VPN_TYPE"):
-                            env[key] = value
-        except OSError:
-            pass
-
-    # Then check config.json files (these override .env)
     for path in config_paths:
         if not path.exists():
             continue
@@ -117,48 +96,11 @@ def load_gluetun_env() -> Dict[str, str]:
     return env
 
 
-def test_proxy_basic(http_proxy: str, timeout: int = 5) -> bool:
-    """Quick test if proxy is accepting connections."""
-    proxies = {"http": http_proxy}
+def test_proxy(http_proxy: str, timeout: int = 10) -> bool:
+    proxies = {"http": http_proxy, "https": http_proxy}
     try:
         resp = requests.get("http://httpbin.org/ip", proxies=proxies, timeout=timeout)
         return resp.status_code == 200
-    except requests.RequestException:
-        return False
-
-
-def test_proxy(http_proxy: str, timeout: int = 15) -> bool:
-    """Test if proxy is working and Reddit is accessible."""
-    proxies = {"http": http_proxy}
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-    }
-    try:
-        # First test basic connectivity with HTTP
-        resp = requests.get("http://httpbin.org/ip", proxies=proxies, timeout=timeout, headers=headers)
-        if resp.status_code != 200:
-            return False
-        # Then verify Reddit JSON access (not blocked)
-        reddit_resp = requests.get(
-            "http://old.reddit.com/r/pics.json?limit=1",
-            proxies=proxies,
-            timeout=timeout,
-            headers=headers
-        )
-        # Check if we got JSON (not blocked HTML page)
-        if reddit_resp.status_code == 200:
-            try:
-                data = reddit_resp.json()
-                if "data" in data:
-                    return True
-            except Exception:
-                pass
-        return False
     except requests.RequestException:
         return False
 
@@ -186,18 +128,15 @@ class GluetunManager:
         return self.info
 
     def restart(self) -> Dict:
-        """Recreate the container to get a fresh IP."""
-        print(f"[GLUETUN] Recreating container {self.container_name} to rotate IP...")
+        print(f"[GLUETUN] Restarting container {self.container_name} to rotate IP...")
         try:
             container = self.client.containers.get(self.container_name)
-            print(f"[GLUETUN] Stopping and removing old container...")
-            container.stop(timeout=10)
-            container.remove(force=True)
-            time.sleep(2)
+            container.restart(timeout=30)
+            time.sleep(5)
         except docker.errors.NotFound:
-            print(f"[GLUETUN] Container not found, will create fresh")
+            pass
         except docker.errors.APIError as exc:
-            print(f"[GLUETUN] Error removing container: {exc}")
+            print(f"[GLUETUN] Restart error: {exc}. Removing container.")
             try:
                 container.remove(force=True)
             except Exception:
@@ -223,139 +162,96 @@ class GluetunManager:
             if ports.get("8388/tcp"):
                 socks_port = int(ports["8388/tcp"][0]["HostPort"])
             if existing.status != "running":
-                print(f"[GLUETUN] Container not running, starting it...")
                 existing.start()
-                time.sleep(5)
-                existing.reload()
-                ports = existing.attrs.get("NetworkSettings", {}).get("Ports", {}) or {}
-                if ports.get("8888/tcp"):
-                    http_port = int(ports["8888/tcp"][0]["HostPort"])
-                if ports.get("8388/tcp"):
-                    socks_port = int(ports["8388/tcp"][0]["HostPort"])
-
-            http_proxy = f"http://127.0.0.1:{http_port}" if http_port else "http://127.0.0.1:8888"
-            
-            # Wait for proxy to become ready (up to 30 seconds)
-            print(f"[GLUETUN] Waiting for proxy {http_proxy} to become ready...")
-            start_time = time.time()
-            max_wait = 30
-            while time.time() - start_time < max_wait:
-                if test_proxy(http_proxy):
-                    print(f"[GLUETUN] Reusing existing container on port {http_port}")
-                    return {
-                        "container": existing,
-                        "http_port": http_port,
-                        "socks5_port": socks_port,
-                        "http_proxy": http_proxy,
-                    }
                 time.sleep(3)
-            
-            # If still not ready, remove and recreate the container
-            print("[GLUETUN] Proxy not responding, removing container to recreate...")
-            try:
-                existing.stop(timeout=10)
-                existing.remove(force=True)
-                time.sleep(2)
-            except Exception as e:
-                print(f"[GLUETUN] Error removing container: {e}")
-            
-        except docker.errors.NotFound:
-            print(f"[GLUETUN] Container {self.container_name} not found, creating new one...")
 
-        # Retry loop: create container, wait 10s, if not ready destroy and retry
-        max_attempts = 10
-        for attempt in range(1, max_attempts + 1):
-            # Clean up any existing container first
-            try:
-                old = self.client.containers.get(self.container_name)
-                print(f"[GLUETUN] Removing existing container before attempt {attempt}...")
-                old.stop(timeout=5)
-                old.remove(force=True)
-                time.sleep(2)
-            except docker.errors.NotFound:
-                pass
-            except Exception as e:
-                print(f"[GLUETUN] Cleanup error: {e}")
+            http_proxy = f"http://127.0.0.1:{http_port}" if http_port else None
+            # If proxy works, reuse. If it doesn't, wait for it to become healthy
+            # for up to `max_wait` seconds. This prevents racing with another
+            # process (e.g., the register service) that just restarted the
+            # gluetun container.
+            if http_port and test_proxy(http_proxy):
+                print(f"[GLUETUN] Reusing existing container on port {http_port}")
+                return {
+                    "container": existing,
+                    "http_port": http_port,
+                    "socks5_port": socks_port,
+                    "http_proxy": http_proxy,
+                }
+
+            print("[GLUETUN] Existing proxy unhealthy. Waiting for it to become ready...")
+            start_time = time.time()
+            max_wait = 120
+            while time.time() - start_time < max_wait:
                 try:
-                    self.client.containers.get(self.container_name).remove(force=True)
+                    existing.reload()
+                    ports = existing.attrs.get("NetworkSettings", {}).get("Ports", {}) or {}
+                    if ports.get("8888/tcp"):
+                        http_port = int(ports["8888/tcp"][0]["HostPort"])
+                        http_proxy = f"http://127.0.0.1:{http_port}"
+                    if ports.get("8388/tcp"):
+                        socks_port = int(ports["8388/tcp"][0]["HostPort"])
+
+                    if http_port and test_proxy(http_proxy):
+                        print(f"[GLUETUN] Existing container proxy came back on {http_proxy}")
+                        return {
+                            "container": existing,
+                            "http_port": http_port,
+                            "socks5_port": socks_port,
+                            "http_proxy": http_proxy,
+                        }
                 except Exception:
                     pass
-                time.sleep(2)
-
-            http_port = find_available_port(8888)
-            socks_port = find_available_port(8388)
-
-            ports = {
-                "8888/tcp": ("0.0.0.0", http_port),
-                "8388/tcp": ("0.0.0.0", socks_port),
-                "8388/udp": ("0.0.0.0", socks_port),
-            }
-
-            # Ensure network exists or use bridge
-            network_to_use = self.network
-            try:
-                self.client.networks.get(self.network)
-            except docker.errors.NotFound:
-                try:
-                    self.client.networks.create(self.network, driver="bridge")
-                    print(f"[GLUETUN] Created network {self.network}")
-                except docker.errors.APIError:
-                    network_to_use = "bridge"
-                    print(f"[GLUETUN] Using default bridge network")
-
-            print(
-                f"[GLUETUN] Attempt {attempt}/{max_attempts}: Starting container {self.container_name} on "
-                f"http:{http_port}, socks5:{socks_port}"
-            )
-            
-            try:
-                container = self.client.containers.run(
-                    image="qmcgaw/gluetun:latest",
-                    name=self.container_name,
-                    cap_add=["NET_ADMIN"],
-                    devices=["/dev/net/tun:/dev/net/tun"],
-                    environment=self.env,
-                    ports=ports,
-                    network=network_to_use,
-                    detach=True,
-                    restart_policy={"Name": "unless-stopped"},
-                )
-            except docker.errors.APIError as e:
-                print(f"[GLUETUN] Failed to create container: {e}")
                 time.sleep(3)
-                continue
 
-            # Wait up to 20 seconds for proxy to become ready
-            http_proxy = f"http://127.0.0.1:{http_port}"
-            start_time = time.time()
-            # First wait for basic connectivity (VPN to connect)
-            while time.time() - start_time < 12:
-                if test_proxy_basic(http_proxy):
-                    print(f"[GLUETUN] Basic proxy connectivity OK, testing Reddit...")
-                    break
-                time.sleep(1)
-            # Then test full Reddit access
-            while time.time() - start_time < 20:
-                if test_proxy(http_proxy):
-                    print(f"[GLUETUN] Proxy ready on {http_proxy} (attempt {attempt})")
-                    return {
-                        "container": container,
-                        "http_port": http_port,
-                        "socks5_port": socks_port,
-                        "http_proxy": http_proxy,
-                    }
-                time.sleep(2)
-
-            print(f"[GLUETUN] Attempt {attempt} failed - proxy not ready in 20s, destroying and retrying...")
+            print("[GLUETUN] Existing proxy did not recover in time. Removing container to recreate.")
             try:
-                container.stop(timeout=5)
-                container.remove(force=True)
+                existing.remove(force=True)
             except Exception:
                 pass
-            time.sleep(2)
+        except docker.errors.NotFound:
+            pass
 
-        # If all attempts failed, return last attempt info anyway
-        print(f"[GLUETUN] All {max_attempts} attempts failed, continuing with last container...")
+        http_port = find_available_port(8888)
+        socks_port = find_available_port(8388)
+
+        ports = {
+            "8888/tcp": ("0.0.0.0", http_port),
+            "8388/tcp": ("0.0.0.0", socks_port),
+            "8388/udp": ("0.0.0.0", socks_port),
+        }
+
+        print(
+            f"[GLUETUN] Starting new container {self.container_name} on "
+            f"http:{http_port}, socks5:{socks_port} (network: {self.network})"
+        )
+        container = self.client.containers.run(
+            image="qmcgaw/gluetun:latest",
+            name=self.container_name,
+            cap_add=["NET_ADMIN"],
+            devices=["/dev/net/tun:/dev/net/tun"],
+            environment=self.env,
+            ports=ports,
+            network=self.network,
+            detach=True,
+            restart_policy={"Name": "unless-stopped"},
+        )
+
+        start_time = time.time()
+        max_wait = 120
+        http_proxy = f"http://127.0.0.1:{http_port}"
+        while time.time() - start_time < max_wait:
+            if test_proxy(http_proxy):
+                print(f"[GLUETUN] Proxy ready on {http_proxy}")
+                return {
+                    "container": container,
+                    "http_port": http_port,
+                    "socks5_port": socks_port,
+                    "http_proxy": http_proxy,
+                }
+            time.sleep(3)
+
+        print("[GLUETUN] Proxy not ready after waiting, continuing anyway.")
         return {
             "container": container,
             "http_port": http_port,
